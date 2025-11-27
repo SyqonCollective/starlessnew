@@ -1,149 +1,387 @@
+"""
+MSRF-NAFNet: Multi-Scale Receptive Field NAFNet for Star Removal
+Advanced architecture with genuine texture reconstruction, no blob artifacts
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import List, Tuple
+
+
+class LayerNormFunction(torch.autograd.Function):
+    """Custom LayerNorm for better performance"""
+    @staticmethod
+    def forward(ctx, x, weight, bias, eps):
+        ctx.eps = eps
+        N, C, H, W = x.size()
+        mu = x.mean(1, keepdim=True)
+        var = (x - mu).pow(2).mean(1, keepdim=True)
+        y = (x - mu) / (var + eps).sqrt()
+        ctx.save_for_backward(y, var, weight)
+        y = weight.view(1, C, 1, 1) * y + bias.view(1, C, 1, 1)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        eps = ctx.eps
+        N, C, H, W = grad_output.size()
+        y, var, weight = ctx.saved_variables
+        g = grad_output * weight.view(1, C, 1, 1)
+        mean_g = g.mean(dim=1, keepdim=True)
+        mean_gy = (g * y).mean(dim=1, keepdim=True)
+        gx = 1. / torch.sqrt(var + eps) * (g - y * mean_gy - mean_g)
+        return gx, (grad_output * y).sum(dim=3).sum(dim=2).sum(dim=0), grad_output.sum(dim=3).sum(dim=2).sum(dim=0), None
 
 
 class LayerNorm2d(nn.Module):
+    """LayerNorm for channels-first tensors"""
     def __init__(self, channels, eps=1e-6):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(1, channels, 1, 1))
-        self.bias = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self.weight = nn.Parameter(torch.ones(channels))
+        self.bias = nn.Parameter(torch.zeros(channels))
         self.eps = eps
 
     def forward(self, x):
-        mean = x.mean(dim=(2, 3), keepdim=True)
-        var = x.var(dim=(2, 3), unbiased=False, keepdim=True)
-        x = (x - mean) / torch.sqrt(var + self.eps)
-        return x * self.weight + self.bias
+        return LayerNormFunction.apply(x, self.weight, self.bias, self.eps)
 
 
 class SimpleGate(nn.Module):
+    """Simple gating mechanism for NAFNet"""
     def forward(self, x):
         x1, x2 = x.chunk(2, dim=1)
         return x1 * x2
 
 
-class NAFBlock(nn.Module):
-    def __init__(self, channels, drop_path=0.0):
+class MultiScaleConv(nn.Module):
+    """Multi-scale convolution for diverse receptive fields"""
+    def __init__(self, channels, scales=[1, 3, 5, 7]):
         super().__init__()
+        self.scales = scales
+        self.convs = nn.ModuleList([
+            nn.Conv2d(channels, channels, kernel_size=k, padding=k//2, groups=channels)
+            for k in scales
+        ])
+        self.fusion = nn.Conv2d(channels * len(scales), channels, 1)
+        
+    def forward(self, x):
+        outputs = [conv(x) for conv in self.convs]
+        fused = torch.cat(outputs, dim=1)
+        return self.fusion(fused)
+
+
+class ChannelAttention(nn.Module):
+    """Channel attention for feature recalibration"""
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False)
+        )
+        
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        return torch.sigmoid(avg_out + max_out) * x
+
+
+class SpatialAttention(nn.Module):
+    """Spatial attention for local texture preservation"""
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2)
+        
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        attention = torch.cat([avg_out, max_out], dim=1)
+        attention = torch.sigmoid(self.conv(attention))
+        return x * attention
+
+
+class TextureAwareBlock(nn.Module):
+    """
+    Texture-aware processing block with multi-scale features
+    Designed to preserve and generate genuine texture instead of blob artifacts
+    """
+    def __init__(self, channels, dw_expand=2, ffn_expand=2):
+        super().__init__()
+        dw_channels = channels * dw_expand
+        
+        # Multi-scale depth-wise convolution
+        self.conv1 = nn.Conv2d(channels, dw_channels, 1)
+        self.multi_scale = MultiScaleConv(dw_channels)
+        self.sg = SimpleGate()
+        self.conv2 = nn.Conv2d(dw_channels // 2, channels, 1)
+        
+        # Attention mechanisms for texture preservation
+        self.channel_attn = ChannelAttention(channels)
+        self.spatial_attn = SpatialAttention()
+        
+        # Feed-forward network
+        ffn_channels = channels * ffn_expand
+        self.ffn_conv1 = nn.Conv2d(channels, ffn_channels, 1)
+        self.ffn_conv2 = nn.Conv2d(ffn_channels // 2, channels, 1)
+        
+        # Normalization
         self.norm1 = LayerNorm2d(channels)
-        self.conv1 = nn.Conv2d(channels, channels * 2, kernel_size=1, padding=0, bias=True)
-        self.dwconv = nn.Conv2d(
-            channels * 2, channels * 2, kernel_size=3, padding=1, groups=channels * 2, bias=True
-        )
-        self.simple_gate = SimpleGate()
-        self.sca = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, channels, kernel_size=1, bias=True),
-            nn.Sigmoid(),
-        )
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=1, padding=0, bias=True)
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-
         self.norm2 = LayerNorm2d(channels)
-        self.conv3 = nn.Conv2d(channels, channels * 2, kernel_size=1, padding=0, bias=True)
-        self.conv4 = nn.Conv2d(channels, channels, kernel_size=1, padding=0, bias=True)
-
-        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
-        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        
+        # Beta and gamma for adaptive feature modulation
+        self.beta = nn.Parameter(torch.zeros((1, channels, 1, 1)))
+        self.gamma = nn.Parameter(torch.zeros((1, channels, 1, 1)))
 
     def forward(self, x):
+        # First branch: multi-scale spatial processing
         residual = x
         x = self.norm1(x)
         x = self.conv1(x)
-        x = self.dwconv(x)
-        x = self.simple_gate(x)
-        x = self.sca(x) * x
+        x = self.multi_scale(x)
+        x = self.sg(x)
         x = self.conv2(x)
-        x = residual + self.drop_path(x) * self.beta
-
-        residual2 = x
+        
+        # Apply attention for texture awareness
+        x = self.channel_attn(x)
+        x = self.spatial_attn(x)
+        
+        x = residual + x * self.beta
+        
+        # Second branch: feed-forward network
+        residual = x
         x = self.norm2(x)
-        x = self.conv3(x)
-        x = self.simple_gate(x)
-        x = self.conv4(x)
-        x = residual2 + self.drop_path(x) * self.gamma
+        x = self.ffn_conv1(x)
+        x = self.sg(x)
+        x = self.ffn_conv2(x)
+        x = residual + x * self.gamma
+        
         return x
 
 
-class DropPath(nn.Module):
-    def __init__(self, drop_prob=0.0):
+class ContextAggregation(nn.Module):
+    """
+    Context aggregation module to gather texture from surrounding regions
+    Critical for filling star regions with genuine texture from context
+    """
+    def __init__(self, channels, num_heads=8):
         super().__init__()
-        self.drop_prob = drop_prob
-
+        self.num_heads = num_heads
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+        
+        self.qkv = nn.Conv2d(channels, channels * 3, 1, bias=False)
+        self.project_out = nn.Conv2d(channels, channels, 1)
+        
     def forward(self, x):
-        if self.drop_prob == 0.0 or not self.training:
-            return x
-        keep_prob = 1 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-        random_tensor.floor_()
-        return x / keep_prob * random_tensor
+        b, c, h, w = x.shape
+        
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=1)
+        
+        q = q.reshape(b, self.num_heads, c // self.num_heads, h * w)
+        k = k.reshape(b, self.num_heads, c // self.num_heads, h * w)
+        v = v.reshape(b, self.num_heads, c // self.num_heads, h * w)
+        
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+        
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        attn = attn.softmax(dim=-1)
+        
+        out = (attn @ v)
+        out = out.reshape(b, c, h, w)
+        out = self.project_out(out)
+        
+        return out
 
 
-class NAFNetSmall(nn.Module):
+class DownSample(nn.Module):
+    """Downsampling with pixel unshuffle"""
+    def __init__(self, in_channels, scale=2):
+        super().__init__()
+        self.down = nn.Sequential(
+            nn.PixelUnshuffle(scale),
+            nn.Conv2d(in_channels * scale * scale, in_channels * 2, 1)
+        )
+        
+    def forward(self, x):
+        return self.down(x)
+
+
+class UpSample(nn.Module):
+    """Upsampling with pixel shuffle"""
+    def __init__(self, in_channels, scale=2):
+        super().__init__()
+        self.up = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels * scale * scale // 2, 1),
+            nn.PixelShuffle(scale)
+        )
+        
+    def forward(self, x):
+        return self.up(x)
+
+
+class MSRFNAFNet(nn.Module):
+    """
+    Multi-Scale Receptive Field NAFNet for Star Removal
+    
+    Architecture optimized for:
+    - Genuine texture reconstruction (no blob artifacts)
+    - Context-aware inpainting from surrounding regions
+    - Multi-scale feature processing
+    - High-quality detail preservation
+    """
     def __init__(
         self,
+        img_channels=3,
         width=32,
-        enc_blocks=(2, 2, 4, 8),
-        middle_blocks=8,
-        dec_blocks=(2, 2, 2, 2),
-        num_channels=3,
+        middle_blk_num=12,
+        enc_blk_nums=[2, 2, 4, 8],
+        dec_blk_nums=[2, 2, 2, 2]
     ):
         super().__init__()
-        self.intro = nn.Conv2d(num_channels, width, kernel_size=3, padding=1, bias=True)
-        self.ending = nn.Conv2d(width, num_channels, kernel_size=3, padding=1, bias=True)
-
-        enc_channels = [width, width * 2, width * 4, width * 8]
-        dec_channels = enc_channels[::-1]
-
+        
+        self.intro = nn.Conv2d(img_channels, width, 3, padding=1)
+        self.ending = nn.Conv2d(width, img_channels, 3, padding=1)
+        
+        # Encoder
         self.encoders = nn.ModuleList()
         self.downs = nn.ModuleList()
-        for i, num_blocks in enumerate(enc_blocks):
-            blocks = [NAFBlock(enc_channels[i]) for _ in range(num_blocks)]
-            self.encoders.append(nn.Sequential(*blocks))
-            if i < len(enc_blocks) - 1:
-                self.downs.append(
-                    nn.Conv2d(enc_channels[i], enc_channels[i + 1], kernel_size=2, stride=2, bias=True)
-                )
-
-        self.mid = nn.Sequential(*[NAFBlock(enc_channels[-1]) for _ in range(middle_blocks)])
-
-        self.ups = nn.ModuleList()
+        chan = width
+        
+        for num in enc_blk_nums:
+            self.encoders.append(
+                nn.Sequential(*[TextureAwareBlock(chan) for _ in range(num)])
+            )
+            self.downs.append(DownSample(chan))
+            chan = chan * 2
+        
+        # Middle blocks with context aggregation
+        self.middle_blks = nn.ModuleList()
+        for _ in range(middle_blk_num):
+            self.middle_blks.append(TextureAwareBlock(chan))
+        
+        # Context aggregation for texture gathering
+        self.context_agg = nn.ModuleList([
+            ContextAggregation(chan) for _ in range(3)
+        ])
+        
+        # Decoder
         self.decoders = nn.ModuleList()
-        for i, num_blocks in enumerate(dec_blocks):
-            blocks = [NAFBlock(dec_channels[i]) for _ in range(num_blocks)]
-            self.decoders.append(nn.Sequential(*blocks))
-            if i < len(dec_blocks) - 1:
-                self.ups.append(
-                    nn.ConvTranspose2d(dec_channels[i], dec_channels[i + 1], kernel_size=2, stride=2, bias=True)
-                )
-
-        self.fusions = nn.ModuleList()
-        for i in range(len(dec_channels) - 1):
-            fused_channels = dec_channels[i + 1] + enc_channels[len(enc_channels) - 2 - i]
-            self.fusions.append(nn.Conv2d(fused_channels, dec_channels[i + 1], kernel_size=1, bias=True))
-
+        self.ups = nn.ModuleList()
+        
+        for num in dec_blk_nums:
+            self.ups.append(UpSample(chan))
+            chan = chan // 2
+            self.decoders.append(
+                nn.Sequential(*[TextureAwareBlock(chan) for _ in range(num)])
+            )
+        
+        # Skip connection fusion
+        self.skip_fusions = nn.ModuleList()
+        chan = width
+        for _ in enc_blk_nums:
+            self.skip_fusions.append(nn.Conv2d(chan * 2, chan, 1))
+            chan = chan * 2
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='linear')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+    
     def forward(self, x):
+        # Store input for residual
+        inp_residual = x
+        
+        # Intro convolution
         x = self.intro(x)
+        
+        # Encoder with skip connections
+        encs = []
+        for encoder, down in zip(self.encoders, self.downs):
+            x = encoder(x)
+            encs.append(x)
+            x = down(x)
+        
+        # Middle processing with context aggregation
+        for i, blk in enumerate(self.middle_blks):
+            x = blk(x)
+            # Apply context aggregation every 4 blocks
+            if i % 4 == 0 and i // 4 < len(self.context_agg):
+                x = x + self.context_agg[i // 4](x)
+        
+        # Decoder with skip connections
+        for decoder, up, enc_skip, fusion in zip(
+            self.decoders, self.ups, reversed(encs), reversed(self.skip_fusions)
+        ):
+            x = up(x)
+            x = fusion(torch.cat([x, enc_skip], dim=1))
+            x = decoder(x)
+        
+        # Ending convolution
+        x = self.ending(x)
+        
+        # Residual connection with input
+        x = x + inp_residual
+        
+        return x
 
-        enc_feats = []
-        out = x
-        for i, encoder in enumerate(self.encoders):
-            out = encoder(out)
-            enc_feats.append(out)
-            if i < len(self.downs):
-                out = self.downs[i](out)
 
-        out = self.mid(out)
+def create_msrf_nafnet_s():
+    """Create MSRF-NAFNet-S model (optimized for RTX 5090)"""
+    return MSRFNAFNet(
+        img_channels=3,
+        width=32,
+        middle_blk_num=12,
+        enc_blk_nums=[2, 2, 4, 8],
+        dec_blk_nums=[2, 2, 2, 2]
+    )
 
-        for i, decoder in enumerate(self.decoders):
-            out = decoder(out)
-            if i < len(self.ups):
-                out = self.ups[i](out)
-                skip = enc_feats[len(enc_feats) - 2 - i]
-                out = torch.cat([out, skip], dim=1)
-                out = self.fusions[i](out)
 
-        out = self.ending(out)
-        return out  # residual prediction
+def create_msrf_nafnet_m():
+    """Create MSRF-NAFNet-M model (higher capacity)"""
+    return MSRFNAFNet(
+        img_channels=3,
+        width=48,
+        middle_blk_num=16,
+        enc_blk_nums=[2, 3, 4, 8],
+        dec_blk_nums=[2, 3, 4, 2]
+    )
+
+
+def create_msrf_nafnet_l():
+    """Create MSRF-NAFNet-L model (maximum quality)"""
+    return MSRFNAFNet(
+        img_channels=3,
+        width=64,
+        middle_blk_num=20,
+        enc_blk_nums=[3, 3, 6, 12],
+        dec_blk_nums=[3, 3, 6, 3]
+    )
+
+
+if __name__ == '__main__':
+    # Test model
+    model = create_msrf_nafnet_s()
+    x = torch.randn(1, 3, 256, 256)
+    
+    with torch.no_grad():
+        y = model(x)
+    
+    print(f"Input shape: {x.shape}")
+    print(f"Output shape: {y.shape}")
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")

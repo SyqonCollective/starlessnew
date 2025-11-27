@@ -1,0 +1,34 @@
+# MSRF-NAFNet for Star Removal
+# Python dependencies - optimized for RTX 5090
+
+# Core deep learning
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
+
+# Data processing
+numpy>=1.24.0
+pillow>=10.0.0
+opencv-python>=4.8.0
+albumentations>=1.3.1
+
+# Metrics and visualization
+scikit-image>=0.21.0
+matplotlib>=3.7.0
+tensorboard>=2.14.0
+
+# Configuration
+pyyaml>=6.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# Optional but recommended for performance
+# Install with: pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu121
+# For latest PyTorch 2.x with CUDA 12.1+ support
+
+# For LPIPS metric (optional)
+lpips>=0.1.4
+
+# For better image I/O
+imageio>=2.31.0

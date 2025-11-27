@@ -1,0 +1,60 @@
+# MSRF-NAFNet Configuration
+# Optimized for RTX 5090 - Star Removal with Genuine Texture Reconstruction
+
+# Model configuration
+model:
+  type: msrf_nafnet_s  # Options: msrf_nafnet_s, msrf_nafnet_m, msrf_nafnet_l
+
+# Data configuration
+data:
+  root_dir: "/Users/michaelruggeri/Desktop/starless"
+  num_workers: 8  # Increase for faster CPU preprocessing
+  patch_size: 256  # Training patch size (increase to 384 or 512 for higher quality)
+
+# Training configuration
+training:
+  # Basic settings
+  batch_size: 16  # RTX 5090 can handle 16-32 depending on patch size
+  epochs: 500
+  
+  # Optimization
+  use_amp: true  # Mixed precision for 2x speedup on RTX 5090
+  gradient_accumulation_steps: 1  # Increase if OOM (simulates larger batch)
+  compile_model: true  # PyTorch 2.0+ compilation for massive speedup
+  
+  # EMA (Exponential Moving Average)
+  use_ema: true
+  ema_decay: 0.9999
+  
+  # Intervals
+  log_interval: 50  # Log every N steps
+  val_interval: 1  # Validate every N epochs
+  save_interval: 10  # Save checkpoint every N epochs
+
+# Optimizer configuration
+optimizer:
+  type: adamw  # Options: adam, adamw
+  lr: 0.0002  # Initial learning rate
+  beta1: 0.9
+  beta2: 0.999
+  weight_decay: 0.0001  # L2 regularization
+
+# Learning rate scheduler
+scheduler:
+  type: cosine_warmup  # Options: cosine, cosine_warmup, step
+  min_lr: 0.000001
+  warmup_steps: 1000  # Warmup for stable training
+  first_cycle_steps: 50000
+  cycle_mult: 1.0
+  gamma: 0.5
+
+# Loss function weights
+loss:
+  l1_weight: 1.0  # Pixel-wise L1 loss
+  perceptual_weight: 1.0  # VGG perceptual loss (critical for texture)
+  texture_weight: 0.5  # Gram matrix texture loss (prevents blob artifacts)
+  edge_weight: 0.3  # Edge preservation loss
+  frequency_weight: 0.2  # Frequency domain loss
+
+# Output directories
+output_dir: "./output"  # All outputs will be saved here

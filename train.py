@@ -1,266 +1,400 @@
-import os
-from argparse import Namespace
-from typing import Optional
+"""
+Professional training script for MSRF-NAFNet
+Optimized for RTX 5090 with all advanced features
+"""
 
 import torch
-import torch.distributed as dist
-import torch.nn.functional as F
-from torch import nn
-from torch.amp import autocast, GradScaler
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.nn as nn
+import torch.optim as optim
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.tensorboard import SummaryWriter
+import yaml
+import argparse
+from pathlib import Path
 from tqdm import tqdm
+import time
+from collections import defaultdict
+import numpy as np
 
-from dataset import StarDataset
-from model import NAFNetSmall
-from utils import PerceptualLoss, reconstruct_from_residual, ssim, save_checkpoint, load_image, tensor_to_image
-
-
-def is_main_process():
-    return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
-
-
-def reduce_tensor(tensor: torch.Tensor):
-    if not dist.is_available() or not dist.is_initialized():
-        return tensor
-    tensor = tensor.clone()
-    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    tensor /= dist.get_world_size()
-    return tensor
+from model import create_msrf_nafnet_s, create_msrf_nafnet_m, create_msrf_nafnet_l
+from dataset import create_dataloaders
+from losses import CombinedLoss
+from utils import (
+    AverageMeter, EMA, save_checkpoint, load_checkpoint,
+    calculate_psnr, calculate_ssim, visualize_results
+)
 
 
-def create_dataloaders(args: Namespace, distributed: bool):
-    train_set = StarDataset(args.data_root, split="train")
-    val_set = StarDataset(args.data_root, split="val")
-
-    train_sampler = DistributedSampler(train_set, shuffle=True) if distributed else None
-    val_sampler = DistributedSampler(val_set, shuffle=False) if distributed else None
-
-    train_loader = DataLoader(
-        train_set,
-        batch_size=args.batch_size,
-        shuffle=(train_sampler is None),
-        num_workers=args.num_workers,
-        pin_memory=True,
-        sampler=train_sampler,
-        drop_last=False,
-    )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        sampler=val_sampler,
-        drop_last=False,
-    )
-    return train_loader, val_loader, train_sampler, val_sampler
-
-
-def build_model(device: torch.device, distributed: bool):
-    model = NAFNetSmall().to(device)
-    if distributed:
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
-    return model
-
-
-def compute_loss(pred: torch.Tensor, target: torch.Tensor, perceptual: nn.Module, return_components: bool = False):
-    pred = pred.float()
-    target = target.float()
-    l1 = F.l1_loss(pred, target)
-    ssim_loss = 1.0 - ssim(pred, target)
-    p_loss = perceptual(pred, target)
-    total = l1 + ssim_loss + p_loss
-    if return_components:
-        return total, (l1.detach(), ssim_loss.detach(), p_loss.detach())
-    return total
-
-
-def train_one_epoch(
-    model,
-    train_loader,
-    optimizer,
-    scheduler,
-    scaler: GradScaler,
-    perceptual: nn.Module,
-    device: torch.device,
-    distributed: bool,
-    epoch: int,
-    total_epochs: int,
-):
-    model.train()
-    epoch_loss = 0.0
-    pbar = tqdm(
-        train_loader,
-        disable=not is_main_process(),
-        desc=f"Train {epoch+1}/{total_epochs}",
-        dynamic_ncols=True,
-        leave=False,
-    )
-    for inputs, targets in pbar:
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-        optimizer.zero_grad(set_to_none=True)
-        with autocast("cuda", enabled=device.type == "cuda"):
-            residual = model(inputs)
-            outputs = reconstruct_from_residual(inputs, residual)
-        outputs = torch.nan_to_num(outputs, nan=0.0, posinf=1.0, neginf=0.0)
-        targets = torch.nan_to_num(targets, nan=0.0, posinf=1.0, neginf=0.0)
-        # compute loss in fp32 to avoid NaNs with SSIM/perceptual
-        loss, (l1_loss, ssim_loss, p_loss) = compute_loss(
-            outputs.float(), targets.float(), perceptual, return_components=True
+class Trainer:
+    """Professional trainer with all modern features"""
+    
+    def __init__(self, config):
+        self.config = config
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Create output directories
+        self.output_dir = Path(config['output_dir'])
+        self.checkpoint_dir = self.output_dir / 'checkpoints'
+        self.log_dir = self.output_dir / 'logs'
+        self.vis_dir = self.output_dir / 'visualizations'
+        
+        for dir_path in [self.checkpoint_dir, self.log_dir, self.vis_dir]:
+            dir_path.mkdir(parents=True, exist_ok=True)
+        
+        # Setup tensorboard
+        self.writer = SummaryWriter(log_dir=self.log_dir)
+        
+        # Build model
+        self.build_model()
+        
+        # Setup data loaders
+        self.setup_dataloaders()
+        
+        # Setup loss
+        self.criterion = CombinedLoss(
+            l1_weight=config['loss']['l1_weight'],
+            perceptual_weight=config['loss']['perceptual_weight'],
+            texture_weight=config['loss']['texture_weight'],
+            edge_weight=config['loss']['edge_weight'],
+            frequency_weight=config['loss']['frequency_weight']
+        ).to(self.device)
+        
+        # Setup optimizer
+        self.setup_optimizer()
+        
+        # Setup scheduler
+        self.setup_scheduler()
+        
+        # Mixed precision training
+        self.use_amp = config['training']['use_amp']
+        self.scaler = GradScaler() if self.use_amp else None
+        
+        # EMA for model weights
+        self.use_ema = config['training']['use_ema']
+        if self.use_ema:
+            self.ema = EMA(self.model, decay=config['training']['ema_decay'])
+        
+        # Training state
+        self.current_epoch = 0
+        self.global_step = 0
+        self.best_psnr = 0.0
+        
+        # Gradient accumulation
+        self.accumulation_steps = config['training']['gradient_accumulation_steps']
+    
+    def build_model(self):
+        """Build model architecture"""
+        model_type = self.config['model']['type']
+        
+        if model_type == 'msrf_nafnet_s':
+            self.model = create_msrf_nafnet_s()
+        elif model_type == 'msrf_nafnet_m':
+            self.model = create_msrf_nafnet_m()
+        elif model_type == 'msrf_nafnet_l':
+            self.model = create_msrf_nafnet_l()
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
+        
+        self.model = self.model.to(self.device)
+        
+        # Count parameters
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        
+        print(f"\nModel: {model_type}")
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,}")
+        
+        # Compile model for PyTorch 2.0+ (massive speedup on RTX 5090)
+        if hasattr(torch, 'compile') and self.config['training'].get('compile_model', True):
+            print("Compiling model with torch.compile for optimal performance...")
+            self.model = torch.compile(self.model, mode='max-autotune')
+    
+    def setup_dataloaders(self):
+        """Setup data loaders"""
+        self.train_loader, self.val_loader = create_dataloaders(
+            root_dir=self.config['data']['root_dir'],
+            batch_size=self.config['training']['batch_size'],
+            num_workers=self.config['data']['num_workers'],
+            patch_size=self.config['data']['patch_size'],
+            pin_memory=True,
+            prefetch=True,
+            device=self.device
         )
-        if not torch.isfinite(loss):
-            if is_main_process():
-                pbar.set_postfix(loss="NaN", note="skip step")
-            scaler.update()
-            continue
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
-
-        epoch_loss += loss.detach()
-        if is_main_process():
-            pbar.set_postfix(
-                loss=loss.item(),
-                l1=l1_loss.item(),
-                ssim=ssim_loss.item(),
-                perc=p_loss.item(),
+        
+        print(f"\nDataset loaded:")
+        print(f"Train batches: {len(self.train_loader)}")
+        print(f"Val batches: {len(self.val_loader)}")
+    
+    def setup_optimizer(self):
+        """Setup optimizer"""
+        opt_config = self.config['optimizer']
+        
+        if opt_config['type'] == 'adamw':
+            self.optimizer = optim.AdamW(
+                self.model.parameters(),
+                lr=opt_config['lr'],
+                betas=(opt_config['beta1'], opt_config['beta2']),
+                weight_decay=opt_config['weight_decay']
             )
-
-    total_batches = len(train_loader)
-    epoch_loss = epoch_loss / total_batches
-    epoch_loss = reduce_tensor(epoch_loss) if distributed else epoch_loss
-    return epoch_loss.item()
-
-
-def validate(model, val_loader, perceptual: nn.Module, device: torch.device, distributed: bool):
-    model.eval()
-    total_loss = 0.0
-    total_count = 0
-    pbar = tqdm(
-        val_loader,
-        disable=not is_main_process(),
-        desc="Validating",
-        dynamic_ncols=True,
-        leave=False,
-    )
-    with torch.no_grad():
-        for inputs, targets in pbar:
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            residual = model(inputs)
-            outputs = reconstruct_from_residual(inputs, residual)
-            outputs = torch.nan_to_num(outputs, nan=0.0, posinf=1.0, neginf=0.0)
-            targets = torch.nan_to_num(targets, nan=0.0, posinf=1.0, neginf=0.0)
-            loss = compute_loss(outputs.float(), targets.float(), perceptual)
-            total_loss += loss.detach() * inputs.size(0)
-            total_count += inputs.size(0)
-            if is_main_process():
-                pbar.set_postfix(loss=loss.item())
-    if distributed:
-        total = torch.tensor([total_loss.item(), total_count], device=device)
-        dist.all_reduce(total, op=dist.ReduceOp.SUM)
-        total_loss = total[0]
-        total_count = total[1]
-    mean_loss = total_loss / total_count
-    return mean_loss.item()
-
-
-def train_model(args: Namespace):
-    distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
-    if distributed:
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(device, distributed)
-    perceptual = PerceptualLoss().to(device)
-
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scaler = GradScaler(enabled=device.type == "cuda")
-
-    train_loader, val_loader, train_sampler, _ = create_dataloaders(args, distributed)
-    steps_per_epoch = len(train_loader)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs * steps_per_epoch)
-    start_epoch = 0
-    best_val = float("inf")
-    if args.checkpoint is not None:
-        ckpt = torch.load(args.checkpoint, map_location=device)
-        state_dict = ckpt["model"] if "model" in ckpt else ckpt
-        (model.module if isinstance(model, DDP) else model).load_state_dict(state_dict, strict=True)
-        if "optimizer" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer"])
-        if "scheduler" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler"])
-        if "scaler" in ckpt and isinstance(scaler, GradScaler):
-            scaler.load_state_dict(ckpt["scaler"])
-        start_epoch = ckpt.get("epoch", 0)
-        best_val = ckpt.get("best_val", best_val)
-    if train_sampler is not None:
-        train_sampler.set_epoch(start_epoch)
-
-    checkpoint_name = "nafnet_star_removal.pth"
-    for epoch in range(start_epoch, args.epochs):
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
-        train_loss = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            scheduler,
-            scaler,
-            perceptual,
-            device,
-            distributed,
-            epoch,
-            args.epochs,
+        elif opt_config['type'] == 'adam':
+            self.optimizer = optim.Adam(
+                self.model.parameters(),
+                lr=opt_config['lr'],
+                betas=(opt_config['beta1'], opt_config['beta2'])
+            )
+        else:
+            raise ValueError(f"Unknown optimizer: {opt_config['type']}")
+    
+    def setup_scheduler(self):
+        """Setup learning rate scheduler"""
+        sched_config = self.config['scheduler']
+        
+        if sched_config['type'] == 'cosine':
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=self.config['training']['epochs'],
+                eta_min=sched_config['min_lr']
+            )
+        elif sched_config['type'] == 'cosine_warmup':
+            from utils import CosineAnnealingWarmupRestarts
+            self.scheduler = CosineAnnealingWarmupRestarts(
+                self.optimizer,
+                first_cycle_steps=sched_config['first_cycle_steps'],
+                cycle_mult=sched_config.get('cycle_mult', 1.0),
+                max_lr=self.config['optimizer']['lr'],
+                min_lr=sched_config['min_lr'],
+                warmup_steps=sched_config['warmup_steps'],
+                gamma=sched_config.get('gamma', 1.0)
+            )
+        elif sched_config['type'] == 'step':
+            self.scheduler = optim.lr_scheduler.StepLR(
+                self.optimizer,
+                step_size=sched_config['step_size'],
+                gamma=sched_config['gamma']
+            )
+        else:
+            self.scheduler = None
+    
+    def train_epoch(self, epoch):
+        """Train for one epoch"""
+        self.model.train()
+        
+        losses = AverageMeter()
+        psnr_meter = AverageMeter()
+        
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.config['training']['epochs']}")
+        
+        for i, (inputs, targets) in enumerate(pbar):
+            # Move to device if not using prefetch loader
+            if not isinstance(self.train_loader, type(self.train_loader)):
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
+            
+            # Forward pass with mixed precision
+            with autocast(enabled=self.use_amp):
+                outputs = self.model(inputs)
+                loss = self.criterion(outputs, targets) / self.accumulation_steps
+            
+            # Backward pass
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            
+            # Update weights with gradient accumulation
+            if (i + 1) % self.accumulation_steps == 0:
+                if self.use_amp:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                
+                self.optimizer.zero_grad(set_to_none=True)
+                
+                # Update EMA
+                if self.use_ema:
+                    self.ema.update()
+                
+                self.global_step += 1
+            
+            # Calculate metrics
+            with torch.no_grad():
+                psnr = calculate_psnr(outputs, targets)
+            
+            # Update meters
+            losses.update(loss.item() * self.accumulation_steps, inputs.size(0))
+            psnr_meter.update(psnr, inputs.size(0))
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f'{losses.avg:.4f}',
+                'psnr': f'{psnr_meter.avg:.2f}',
+                'lr': f'{self.optimizer.param_groups[0]["lr"]:.6f}'
+            })
+            
+            # Log to tensorboard
+            if self.global_step % self.config['training']['log_interval'] == 0:
+                self.writer.add_scalar('train/loss', losses.avg, self.global_step)
+                self.writer.add_scalar('train/psnr', psnr_meter.avg, self.global_step)
+                self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
+        
+        return losses.avg, psnr_meter.avg
+    
+    @torch.no_grad()
+    def validate(self, epoch):
+        """Validate model"""
+        # Use EMA model for validation if available
+        if self.use_ema:
+            self.ema.apply_shadow()
+        
+        self.model.eval()
+        
+        losses = AverageMeter()
+        psnr_meter = AverageMeter()
+        ssim_meter = AverageMeter()
+        
+        pbar = tqdm(self.val_loader, desc="Validation")
+        
+        for i, (inputs, targets) in enumerate(pbar):
+            # Move to device if needed
+            if not isinstance(self.val_loader, type(self.val_loader)):
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
+            
+            # Forward pass
+            with autocast(enabled=self.use_amp):
+                outputs = self.model(inputs)
+                loss = self.criterion(outputs, targets)
+            
+            # Calculate metrics
+            psnr = calculate_psnr(outputs, targets)
+            ssim = calculate_ssim(outputs, targets)
+            
+            # Update meters
+            losses.update(loss.item(), inputs.size(0))
+            psnr_meter.update(psnr, inputs.size(0))
+            ssim_meter.update(ssim, inputs.size(0))
+            
+            pbar.set_postfix({
+                'loss': f'{losses.avg:.4f}',
+                'psnr': f'{psnr_meter.avg:.2f}',
+                'ssim': f'{ssim_meter.avg:.4f}'
+            })
+            
+            # Visualize first batch
+            if i == 0:
+                vis_path = self.vis_dir / f'epoch_{epoch:04d}.png'
+                visualize_results(inputs, outputs, targets, vis_path, max_images=4)
+        
+        # Log to tensorboard
+        self.writer.add_scalar('val/loss', losses.avg, epoch)
+        self.writer.add_scalar('val/psnr', psnr_meter.avg, epoch)
+        self.writer.add_scalar('val/ssim', ssim_meter.avg, epoch)
+        
+        # Restore original model weights
+        if self.use_ema:
+            self.ema.restore()
+        
+        return losses.avg, psnr_meter.avg, ssim_meter.avg
+    
+    def train(self):
+        """Main training loop"""
+        print("\n" + "="*50)
+        print("Starting training...")
+        print("="*50 + "\n")
+        
+        start_time = time.time()
+        
+        for epoch in range(self.current_epoch, self.config['training']['epochs']):
+            self.current_epoch = epoch
+            
+            # Train
+            train_loss, train_psnr = self.train_epoch(epoch)
+            
+            # Validate
+            if (epoch + 1) % self.config['training']['val_interval'] == 0:
+                val_loss, val_psnr, val_ssim = self.validate(epoch)
+                
+                # Save best model
+                if val_psnr > self.best_psnr:
+                    self.best_psnr = val_psnr
+                    save_checkpoint(
+                        self.model,
+                        self.optimizer,
+                        self.scheduler,
+                        epoch,
+                        self.best_psnr,
+                        self.checkpoint_dir / 'best_model.pth',
+                        ema=self.ema if self.use_ema else None
+                    )
+                    print(f"\n✓ New best model saved! PSNR: {val_psnr:.2f} dB")
+            
+            # Save checkpoint
+            if (epoch + 1) % self.config['training']['save_interval'] == 0:
+                save_checkpoint(
+                    self.model,
+                    self.optimizer,
+                    self.scheduler,
+                    epoch,
+                    self.best_psnr,
+                    self.checkpoint_dir / f'checkpoint_epoch_{epoch:04d}.pth',
+                    ema=self.ema if self.use_ema else None
+                )
+            
+            # Update scheduler
+            if self.scheduler is not None:
+                self.scheduler.step()
+        
+        # Final save
+        save_checkpoint(
+            self.model,
+            self.optimizer,
+            self.scheduler,
+            self.current_epoch,
+            self.best_psnr,
+            self.checkpoint_dir / 'final_model.pth',
+            ema=self.ema if self.use_ema else None
         )
-        val_loss = validate(model, val_loader, perceptual, device, distributed)
-        if is_main_process():
-            print(f"Epoch {epoch+1}/{args.epochs} - train_loss: {train_loss:.4f} - val_loss: {val_loss:.4f}")
-            if (epoch + 1) % args.save_every == 0 or val_loss < best_val:
-                state = {
-                    "epoch": epoch + 1,
-                    "model": model.module.state_dict() if isinstance(model, DDP) else model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "scaler": scaler.state_dict(),
-                    "best_val": min(best_val, val_loss),
-                }
-                save_checkpoint(state, checkpoint_name)
-                best_val = min(best_val, val_loss)
-
-    if distributed:
-        dist.destroy_process_group()
+        
+        total_time = time.time() - start_time
+        print(f"\n" + "="*50)
+        print(f"Training completed in {total_time/3600:.2f} hours")
+        print(f"Best PSNR: {self.best_psnr:.2f} dB")
+        print("="*50)
+        
+        self.writer.close()
 
 
-def load_model_from_checkpoint(model: nn.Module, checkpoint_path: Optional[str], map_location: torch.device):
-    if checkpoint_path is None:
-        return model
-    state = torch.load(checkpoint_path, map_location=map_location)
-    model.load_state_dict(state["model"] if "model" in state else state)
-    return model
+def main():
+    parser = argparse.ArgumentParser(description='Train MSRF-NAFNet for star removal')
+    parser.add_argument('--config', type=str, default='config.yaml', help='Path to config file')
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
+    args = parser.parse_args()
+    
+    # Load config
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Create trainer
+    trainer = Trainer(config)
+    
+    # Resume if checkpoint provided
+    if args.resume:
+        load_checkpoint(
+            args.resume,
+            trainer.model,
+            trainer.optimizer,
+            trainer.scheduler,
+            ema=trainer.ema if trainer.use_ema else None
+        )
+    
+    # Start training
+    trainer.train()
 
 
-def infer(model_path: str, image_path: str, device: torch.device, output_path: Optional[str] = None):
-    if model_path is None:
-        raise ValueError("A trained checkpoint path is required for inference.")
-    model = NAFNetSmall().to(device)
-    model = load_model_from_checkpoint(model, model_path, device)
-    model.eval()
-    img_tensor = load_image(image_path, device)
-    with torch.no_grad():
-        residual = model(img_tensor)
-        result = reconstruct_from_residual(img_tensor, residual)
-    image = tensor_to_image(result)
-    if output_path is None:
-        base, ext = os.path.splitext(image_path)
-        output_path = f"{base}_starless{ext}"
-    image.save(output_path)
-    return output_path
+if __name__ == '__main__':
+    main()
