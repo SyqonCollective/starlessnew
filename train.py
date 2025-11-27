@@ -17,6 +17,7 @@ from collections import defaultdict
 import numpy as np
 
 from model import create_msrf_nafnet_s, create_msrf_nafnet_m, create_msrf_nafnet_l
+from model_restormer import create_restormer_slmr_s, create_restormer_slmr_m
 from dataset import create_dataloaders
 from losses import CombinedLoss
 from utils import (
@@ -87,7 +88,11 @@ class Trainer:
         model_type = self.config['model']['type']
         use_grad_checkpoint = self.config['training'].get('use_gradient_checkpointing', False)
         
-        if model_type == 'msrf_nafnet_s':
+        if model_type == 'restormer_slmr_s':
+            self.model = create_restormer_slmr_s(use_gradient_checkpointing=use_grad_checkpoint)
+        elif model_type == 'restormer_slmr_m':
+            self.model = create_restormer_slmr_m(use_gradient_checkpointing=use_grad_checkpoint)
+        elif model_type == 'msrf_nafnet_s':
             self.model = create_msrf_nafnet_s(use_gradient_checkpointing=use_grad_checkpoint)
         elif model_type == 'msrf_nafnet_m':
             self.model = create_msrf_nafnet_m(use_gradient_checkpointing=use_grad_checkpoint)

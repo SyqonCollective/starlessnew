@@ -3,7 +3,7 @@
 
 # Model configuration
 model:
-  type: msrf_nafnet_s  # Options: msrf_nafnet_s, msrf_nafnet_m, msrf_nafnet_l
+  type: restormer_slmr_s  # Options: restormer_slmr_s, restormer_slmr_m, msrf_nafnet_s
 
 # Data configuration
 data:
