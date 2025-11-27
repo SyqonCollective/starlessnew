@@ -14,7 +14,7 @@ data:
 # Training configuration
 training:
   # Basic settings
-  batch_size: 6  # Ridotto per 512x512 patches
+  batch_size: 4  # Ridotto per 512x512 patches
   epochs: 500
   
   # Optimization
