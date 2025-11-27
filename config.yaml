@@ -7,9 +7,9 @@ model:
 
 # Data configuration
 data:
-  root_dir: "/Users/michaelruggeri/Desktop/starless"
+  root_dir: "/workspace"  # Path sul server RunPod
   num_workers: 8  # Increase for faster CPU preprocessing
-  patch_size: 256  # Training patch size (increase to 384 or 512 for higher quality)
+  patch_size: 512  # Dataset già preparato con tile 512x512
 
 # Training configuration
 training:

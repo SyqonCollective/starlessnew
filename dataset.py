@@ -24,8 +24,8 @@ class StarRemovalDataset(Dataset):
         self,
         root_dir: str,
         split: str = 'train',
-        patch_size: int = 256,
-        augment: bool = True,
+        patch_size: int = 512,
+        augment: bool = False,  # Dataset già con augmentations
         normalize: bool = True
     ):
         super().__init__()
@@ -161,21 +161,12 @@ class StarRemovalDataset(Dataset):
         input_path = self.image_paths[idx]
         target_path = self.target_dir / input_path.name
         
-        # Load images
+        # Load images (già tile 512x512 con augmentations)
         input_img = self.load_image(input_path)
         target_img = self.load_image(target_path)
         
-        # Crop
-        if self.augment:
-            input_img, target_img = self.random_crop(input_img, target_img)
-        else:
-            input_img, target_img = self.center_crop(input_img, target_img)
-        
-        # Apply augmentation
-        if self.transform is not None:
-            transformed = self.transform(image=input_img, target=target_img)
-            input_img = transformed['image']
-            target_img = transformed['target']
+        # Nessun crop necessario - immagini già alla dimensione corretta
+        # Nessuna augmentation - già fatta durante preparazione dataset
         
         # Convert to tensor and normalize to [0, 1]
         input_tensor = torch.from_numpy(input_img).permute(2, 0, 1).float() / 255.0
@@ -221,7 +212,7 @@ def create_dataloaders(
     root_dir: str,
     batch_size: int = 8,
     num_workers: int = 8,
-    patch_size: int = 256,
+    patch_size: int = 512,
     pin_memory: bool = True,
     prefetch: bool = True,
     device: str = 'cuda'
@@ -241,12 +232,12 @@ def create_dataloaders(
     Returns:
         train_loader, val_loader
     """
-    # Create datasets
+    # Create datasets (no augmentation - dataset già preparato)
     train_dataset = StarRemovalDataset(
         root_dir=root_dir,
         split='train',
         patch_size=patch_size,
-        augment=True
+        augment=False  # Dataset già con augmentations
     )
     
     val_dataset = StarRemovalDataset(
