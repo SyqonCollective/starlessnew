@@ -18,7 +18,7 @@ training:
   epochs: 500
   
   # Optimization
-  use_amp: true  # Mixed precision for 2x speedup on RTX 5090
+  use_amp: false  # Disabled - problemi con mixed types
   gradient_accumulation_steps: 1  # Increase if OOM (simulates larger batch)
   compile_model: false  # Disabled - torch.compile ha conflitti con AMP
   
