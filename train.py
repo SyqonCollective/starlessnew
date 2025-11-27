@@ -120,7 +120,8 @@ class Trainer:
             patch_size=self.config['data']['patch_size'],
             pin_memory=True,
             prefetch=True,
-            device=self.device
+            device=self.device,
+            subset_fraction=self.config['data'].get('subset_fraction', 1.0)  # Usa subset se specificato
         )
         
         print(f"\nDataset loaded:")

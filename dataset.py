@@ -26,7 +26,8 @@ class StarRemovalDataset(Dataset):
         split: str = 'train',
         patch_size: int = 512,
         augment: bool = False,  # Dataset già con augmentations
-        normalize: bool = True
+        normalize: bool = True,
+        subset_fraction: float = 1.0  # Usa solo una frazione del dataset
     ):
         super().__init__()
         self.root_dir = Path(root_dir)
@@ -41,15 +42,23 @@ class StarRemovalDataset(Dataset):
         
         # Support multiple image formats
         self.image_extensions = ['.png', '.jpg', '.jpeg', '.tif', '.tiff']
-        self.image_paths = []
+        all_image_paths = []
         
         for ext in self.image_extensions:
-            self.image_paths.extend(sorted(self.input_dir.glob(f'*{ext}')))
+            all_image_paths.extend(sorted(self.input_dir.glob(f'*{ext}')))
         
-        if len(self.image_paths) == 0:
+        if len(all_image_paths) == 0:
             raise ValueError(f"No images found in {self.input_dir}")
         
-        print(f"Found {len(self.image_paths)} images in {split} set")
+        # Use only a subset if specified (for faster experimentation)
+        if subset_fraction < 1.0:
+            random.seed(42)  # Deterministic sampling
+            n_samples = int(len(all_image_paths) * subset_fraction)
+            self.image_paths = random.sample(all_image_paths, n_samples)
+            print(f"Using {len(self.image_paths)}/{len(all_image_paths)} images ({subset_fraction*100:.0f}%) in {split} set")
+        else:
+            self.image_paths = all_image_paths
+            print(f"Found {len(self.image_paths)} images in {split} set")
         
         # Setup augmentation pipeline
         self.setup_augmentation()
@@ -215,7 +224,8 @@ def create_dataloaders(
     patch_size: int = 512,
     pin_memory: bool = True,
     prefetch: bool = False,  # Disabled - gestito manualmente
-    device: str = 'cuda'
+    device: str = 'cuda',
+    subset_fraction: float = 1.0  # Usa solo una frazione del dataset
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Create train and validation dataloaders
@@ -228,6 +238,7 @@ def create_dataloaders(
         pin_memory: Use pinned memory for faster GPU transfer
         prefetch: Use prefetch loader for better performance
         device: Device for prefetching
+        subset_fraction: Fraction of dataset to use (0.0-1.0)
     
     Returns:
         train_loader, val_loader
@@ -237,14 +248,16 @@ def create_dataloaders(
         root_dir=root_dir,
         split='train',
         patch_size=patch_size,
-        augment=False  # Dataset già con augmentations
+        augment=False,  # Dataset già con augmentations
+        subset_fraction=subset_fraction
     )
     
     val_dataset = StarRemovalDataset(
         root_dir=root_dir,
         split='val',
         patch_size=patch_size,
-        augment=False
+        augment=False,
+        subset_fraction=subset_fraction
     )
     
     # Create dataloaders
