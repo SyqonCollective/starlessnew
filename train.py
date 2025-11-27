@@ -6,7 +6,7 @@ Optimized for RTX 5090 with all advanced features
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 import yaml
 import argparse
@@ -67,7 +67,7 @@ class Trainer:
         
         # Mixed precision training
         self.use_amp = config['training']['use_amp']
-        self.scaler = GradScaler() if self.use_amp else None
+        self.scaler = GradScaler('cuda') if self.use_amp else None
         
         # EMA for model weights
         self.use_ema = config['training']['use_ema']
@@ -192,7 +192,7 @@ class Trainer:
                 targets = targets.to(self.device)
             
             # Forward pass with mixed precision
-            with autocast(enabled=self.use_amp):
+            with autocast('cuda', enabled=self.use_amp):
                 outputs = self.model(inputs)
                 loss = self.criterion(outputs, targets) / self.accumulation_steps
             
@@ -266,7 +266,7 @@ class Trainer:
                 targets = targets.to(self.device)
             
             # Forward pass
-            with autocast(enabled=self.use_amp):
+            with autocast('cuda', enabled=self.use_amp):
                 outputs = self.model(inputs)
                 loss = self.criterion(outputs, targets)
             

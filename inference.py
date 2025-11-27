@@ -99,7 +99,7 @@ class Inferencer:
         
         # Inference with mixed precision
         if self.use_amp:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 output = self.model(img_padded)
         else:
             output = self.model(img_padded)
