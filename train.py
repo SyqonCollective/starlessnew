@@ -11,6 +11,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
+from tqdm import tqdm
 
 from dataset import StarDataset
 from model import NAFNetSmall
@@ -67,11 +68,14 @@ def build_model(device: torch.device, distributed: bool):
     return model
 
 
-def compute_loss(pred: torch.Tensor, target: torch.Tensor, perceptual: nn.Module):
+def compute_loss(pred: torch.Tensor, target: torch.Tensor, perceptual: nn.Module, return_components: bool = False):
     l1 = F.l1_loss(pred, target)
     ssim_loss = 1.0 - ssim(pred, target)
     p_loss = perceptual(pred, target)
-    return l1 + ssim_loss + p_loss
+    total = l1 + ssim_loss + p_loss
+    if return_components:
+        return total, (l1.detach(), ssim_loss.detach(), p_loss.detach())
+    return total
 
 
 def train_one_epoch(
@@ -83,23 +87,39 @@ def train_one_epoch(
     perceptual: nn.Module,
     device: torch.device,
     distributed: bool,
+    epoch: int,
+    total_epochs: int,
 ):
     model.train()
     epoch_loss = 0.0
-    for inputs, targets in train_loader:
+    pbar = tqdm(
+        train_loader,
+        disable=not is_main_process(),
+        desc=f"Train {epoch+1}/{total_epochs}",
+        dynamic_ncols=True,
+        leave=False,
+    )
+    for inputs, targets in pbar:
         inputs = inputs.to(device)
         targets = targets.to(device)
         optimizer.zero_grad(set_to_none=True)
         with autocast():
             residual = model(inputs)
             outputs = reconstruct_from_residual(inputs, residual)
-            loss = compute_loss(outputs, targets, perceptual)
+            loss, (l1_loss, ssim_loss, p_loss) = compute_loss(outputs, targets, perceptual, return_components=True)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
 
         epoch_loss += loss.detach()
+        if is_main_process():
+            pbar.set_postfix(
+                loss=loss.item(),
+                l1=l1_loss.item(),
+                ssim=ssim_loss.item(),
+                perc=p_loss.item(),
+            )
 
     total_batches = len(train_loader)
     epoch_loss = epoch_loss / total_batches
@@ -111,8 +131,15 @@ def validate(model, val_loader, perceptual: nn.Module, device: torch.device, dis
     model.eval()
     total_loss = 0.0
     total_count = 0
+    pbar = tqdm(
+        val_loader,
+        disable=not is_main_process(),
+        desc="Validating",
+        dynamic_ncols=True,
+        leave=False,
+    )
     with torch.no_grad():
-        for inputs, targets in val_loader:
+        for inputs, targets in pbar:
             inputs = inputs.to(device)
             targets = targets.to(device)
             residual = model(inputs)
@@ -120,6 +147,8 @@ def validate(model, val_loader, perceptual: nn.Module, device: torch.device, dis
             loss = compute_loss(outputs, targets, perceptual)
             total_loss += loss.detach() * inputs.size(0)
             total_count += inputs.size(0)
+            if is_main_process():
+                pbar.set_postfix(loss=loss.item())
     if distributed:
         total = torch.tensor([total_loss.item(), total_count], device=device)
         dist.all_reduce(total, op=dist.ReduceOp.SUM)
@@ -167,7 +196,16 @@ def train_model(args: Namespace):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, scheduler, scaler, perceptual, device, distributed
+            model,
+            train_loader,
+            optimizer,
+            scheduler,
+            scaler,
+            perceptual,
+            device,
+            distributed,
+            epoch,
+            args.epochs,
         )
         val_loss = validate(model, val_loader, perceptual, device, distributed)
         if is_main_process():
